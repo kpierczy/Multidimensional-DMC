@@ -1,18 +1,16 @@
 %==============================================================
 % Returns object's output for a given input vector. 
 %
-% @param U : input vector
-% @returns : object's output
-%
-% @note : Function uses row, not column vectors.
+% @param U : input vector of size (X x 1)
+% @returns : object's output of size (X x 1)
 %==============================================================
 function Y = simulate(U)
 
     % Get length of the simulation 
-    simulation_time = size(U,2);
+    simulation_time = size(U,1);
 
     % Initialize output vector
-    Y = zeros(1, simulation_time);
+    Y = zeros(simulation_time, 1);
 
     % Simulate
     for i = 1:simulation_time

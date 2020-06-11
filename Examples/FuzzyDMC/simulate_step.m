@@ -3,10 +3,10 @@
 % a required discrete moment. If sizes of the input or output
 % vector is lower than the required moment the error is thrown.
 %
-% @param U : input vector
-% @param Y : output vector
+% @param U : input vector of size (X x 1)
+% @param Y : output vector of size (X x 1)
 % @param moment : required moment
-% @returns : object's output at the 'moment'th momenht 
+% @returns : object's output at the 'moment'th moment 
 %
 %==============================================================
 function y =simulate_step(U, Y, moment)

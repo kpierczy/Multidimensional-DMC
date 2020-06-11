@@ -1,6 +1,6 @@
 %========================================================================
 % File name   : FuzzyDMC.m
-% Date        : 28th April 2020
+% Date        : 11th June 2020
 % Version     : 0.1.0
 % Author      : Krzysztof Pierczyk
 % Description : Generic class implementing MIMO non-linear fuzzy DMC
@@ -8,60 +8,108 @@
 %               and uncontroller (DVs) inputs (internally uses DMC class,
 %               @see DMC)
 %
+% @todo : implement other shapes of fuzzy sets
+%
 %========================================================================
 
 classdef FuzzyDMC < handle
 
-    properties (Dependent = true)
-    
-        % Limits of controlled variables
-        umin  (:, 1) double {mustBeReal} = -Inf
-        umax  (:, 1) double {mustBeReal} =  Inf
-        dumin (:, 1) double {mustBeReal} = -Inf
-        dumax (:, 1) double {mustBeReal} =  Inf
+    properties (Access = public, Dependent = true)
+        
+        % @note : DMC is an incremental regulator (it computes CVs
+        %         increases, not absolute values). To minimize number
+        %         of arguments passed to the 'compute()' method every
+        %         iteration of controll loop DMC class implements
+        %         internal memory region to keep track of regulation
+        %         history.
+        %
+        %         Following properties are public for cases when 
+        %         regulation process is switched to manual for some
+        %         period of time. When regulation is sitched-back to
+        %         automatic regulation these parameters should be updated
+        %         to ensure smooth start-up.
         
         % Last CVs values
         uk_1  (:, 1) double {mustBeReal}
+        
+        % Last DVs values
+        zk_1  (:, 1) double {mustBeReal}
+        
+        % Vector of differences of subsequent CVs on the steerage horizon.
+        dUp   (:, 1) double {mustBeReal} 
+        
+        % Vector of differences of subsequent DVs on the steerage horizon.
+        dZp  (:, 1) double {mustBeReal} 
         
     end
     
     properties (Access = public)
         
-        % Sets-defining value
+        %================================================================
+        % Sets-defining value. Decision about whether and how much 
+        % actual state of the regulated object belongs to the fuzzy set
+        % can be made basing on the input or the output from the object.
+        %================================================================
         sets_base  (1, :) char {mustBeMember( sets_base, { ...
                                     'input', ...
                                     'output'
                                })} = 'output'
         
         
-        % Type of a membership function
+                           
+        % Type of a membership function of fuuzzy sets
         membership (1, :) char {mustBeMember( membership, { ...
                                     'gaussian', ...
                                })} = 'gaussian'
-    end
-    
-    properties (Access = private)
+                           
+       % Array of local regulators
+        regulators cell 
         
-        % Regulated object shape (number of CVs, DVs and PVS)
-        shape (:, 1) uint32 {mustBeInteger, mustBeNonnegative}
-        
-        % Handle to the object-representing function
-        object (1, 1)
-        
-        % Array of local regulators
-        regulators cell     
+        % note : local regulators objects are public to enable easy
+        %        parameters chaning. It should be emhpasized that
+        %        local regulator's models should not be changed
+        %        by the user after FuzzyDMC object's creation
         
     end
     
-    properties (GetAccess = public, SetAccess = private)
+    properties (SetAccess = private, GetAccess = public)
+        
+        % Object's shape
+        nu uint32 {mustBeNonnegative} = 0
+        nz uint32 {mustBeNonnegative} = 0
+        ny uint32 {mustBeNonnegative} = 0
        
         % Parameters of subsequent fuzzy sets
         c     (:, 1) double {mustBeReal} = []
         sigma (:, 1) double {mustBeReal} = []   
         
     end
-
     
+    properties (Access = private)
+        
+        % Internals registers for imits of controlled variables
+        umin  (:, 1) double {mustBeReal} = -Inf
+        umax  (:, 1) double {mustBeReal} =  Inf
+        dumin (:, 1) double {mustBeReal} = -Inf
+        dumax (:, 1) double {mustBeReal} =  Inf
+        
+        % Last CVs values
+        uk_1_shadow  (:, 1) double {mustBeReal}
+        
+        % Last DVs values
+        zk_1_shadow  (:, 1) double {mustBeReal}
+        
+        % Vector of differences of subsequent CVs on the steerage horizon.
+        dUp_shadow   (:, 1) double {mustBeReal} 
+        
+        % Vector of differences of subsequent DVs on the steerage horizon.
+        dZp_shadow  (:, 1) double {mustBeReal} 
+    
+        D_top	(1, 1) uint32 {mustBeInteger, mustBePositive}    = 1
+        Dz_top	(1, 1) uint32 {mustBeInteger, mustBeNonnegative} = 0
+        
+    end
+        
     %====================================================================
     %%%%%%%%%%%%%%%%%%%%%%%%%% Public methods %%%%%%%%%%%%%%%%%%%%%%%%%%%
     %====================================================================
@@ -71,47 +119,19 @@ classdef FuzzyDMC < handle
         %================================================================
         % Fuzzy DMC regulator initialization. 
         % 
-        % @param regulator_specific_struct : Columns array of structures 
-        %        describing specific parameters of local regulators.
-        %        This structure should contain following fields:
+        % @param regulatorsParams : 1D cell array of structures 
+        %        describing local DMCs' parameters. These structures
+        %        should contain fields required by the DMC class'
+        %        constructor (@see DMC)
         %
-        %        .sr_point - array conatining initial values of CVs
-        %             used to gather step responses
-        %
-        %        .sr_step_size - array containing sizes of steps for
-        %             all CVs used to gather step responses
-        %
-        %        .N - prediction horizon; positive integer value.
-        %             If .N is greater than dynamic rank .D (see below)
-        %             it is set to .D
-        %         
-        %        .Nu - control horizon; positive integer value.
-        %             If .Nu is greater than dynamic rank .D (see below)
-        %             it is set to .D
-        %
-        %        .D - dynamic rank; positive integer value.
-        %             If .D is greater than stabilization period of
-        %             the slowest CV-PV track it is cut to the value
-        %             of this period
-        %
-        %        .Dz - disturbance dynamic rank; non-negative integer 
-        %             value. If .Dz is greater than stabilization period 
-        %             of the slowest DV-PV track it is cut to the value
-        %             of this period.
-        %             If .Dz is set to 0 DV-PV tracks are not taken
-        %             into account in regulation process
-        %
-        %
-        %         There are also varian fields that are required only
-        %         if objects meets some requirements. These are :
-        %
-        %        .sr_point_z (required if DVs are present) - array 
-        %             containing initial values of DVs used to
-        %             gather step responses
-        %
-        %        .sr_step_size_z (required if DVs are present) - array 
-        %             containing sizes of steps for all DVs used 
-        %             to gather step responses
+        % @param modelsStruct: 1D cell array of structures 
+        %        describing initializing parameters of local regulators.
+        %        Each structure should contain all fields required by
+        %        either DMC.updateModel() or DMC.updateModelFunction
+        %        (@see DMC) - an appropriate initializer is called
+        %        depending on content of the particular structure.
+        %        Additionally, each structure should contain some
+        %        bonus fields:
         %
         %        .c (required if membership function is set to 
         %             'gaussian') - center of the fuzzy set that a local
@@ -122,86 +142,71 @@ classdef FuzzyDMC < handle
         %             that a local regulator belongs to
         %
         %
-        % @param common_struct : parameters common to all local regula-
-        %        tors. This is structure that should contain following
-        %        fields:
-        %
-        %         .shape - array conataining number of CVs, DVs and PVs
-        %
-        %         .object - handle to the function representing 
-        %              regulated object. For requirements @see DMC
-        %
-        %         .membership_fun - name of the function used to
-        %              compute values in fuzzy sets. Available functions
-        %                  * 'gaussian'
-        %
-        %         .tol (optional, defaul = 0.0001) - maximum difference
-        %               between two values (e.g. subsequent output
-        %               values) that can be approximated as 0
-        %
-        %         .sim_time (optional, default = 1000) - length of the
-        %               simulation used to get step responses
+        % @param membershipFun - name of the function used to
+        %        compute values in fuzzy sets. Available functions:
+        %           - 'gaussian'
         %
         %===============================================================
-        function obj = FuzzyDMC(regulator_specific_struct, common_struct)
+        function obj = FuzzyDMC(regulatorsParams, modelsStruct, membershipFun)
+            
+            % Check if number of regulator is established explicitly
+            if size(regulatorsParams, 1) ~= size(modelsStruct)
+               error('Sizes of regulatorsParams and modelsStruct are not equal!') 
+            end
             
             % Alias arguments names
-            rss = regulator_specific_struct;
-            cs  = common_struct;
-            
-            % Initialize structures for DMC cration
-            sr_structures     = cell(size(rss, 1), 1); 
-            params_structures = cell(size(rss, 1), 1);
-            
-            % Fill sr_structures
-            for i = 1:size(sr_structures, 1)
-                sr_structures{i, 1}.object = cs.object;
-                sr_structures{i, 1}.shape = cs.shape;
-                sr_structures{i, 1}.init_point_u = rss{i, 1}.sr_point;
-                sr_structures{i, 1}.step_size_u = rss{i, 1}.sr_step_size;
-                if cs.shape(2) ~= 0
-                    sr_structures{i, 1}.init_point_z = rss{i, 1}.sr_point_z;
-                    sr_structures{i, 1}.step_size_z = rss{i, 1}.sr_step_size_z;
-                end
-                if isfield(cs, 'tol')
-                    sr_structures{i, 1}.tol = cs.tol;
-                end
-                if isfield(cs, 'sim_time')
-                    sr_structures{i, 1}.sim_time = cs.sim_time;
-                end                
-            end
-            
-            % Fill params_structures
-            for i = 1:size(params_structures, 1)
-                params_structures{i, 1}.N = rss{i, 1}.N;
-                params_structures{i, 1}.Nu = rss{i, 1}.Nu;
-                params_structures{i, 1}.D = rss{i, 1}.D;
-                params_structures{i, 1}.Dz = rss{i, 1}.Dz;
-                params_structures{i, 1}.lambda = rss{i, 1}.lambda;
-            end
+            ms = modelsStruct;
             
             % Set type of membership function
-            obj.membership = cs.membership_fun;
+            if exist('membershipFun', 'var')
+                obj.membership = membershipFun;
+            end
+
+            % Crate regulators
+            obj.regulators = cell(size(ms, 1), 1); 
+            for i = 1:size(ms, 1)
+                obj.regulators{i} = DMC(regulatorsParams{i});
+                if isfield(modelsStruct{i}, 'stepResponsesStruct')
+                    obj.regulators{i}.updateModel(modelsStruct{i})
+                else
+                    obj.regulators{i}.updateModelFunction(modelsStruct{i})
+                end
+            end
             
-            % Save object shape
-            obj.shape = cs.shape;
-                        
+            % Copy shape of the object
+            obj.nu = obj.regulators{i}.nu;
+            obj.nz = obj.regulators{i}.nz;
+            obj.ny = obj.regulators{i}.ny;
+            
             % Save parameters o fmembership function
             switch( obj.membership )
                 case 'gaussian'
-                    for i = 1:size(rss, 1)
-                       obj.c(i) = rss{i, 1}.c; 
+                    for i = 1:size(ms, 1)
+                       obj.c(i) = ms{i, 1}.c; 
                     end
-                    for i = 1:size(rss, 1)
-                       obj.sigma(i) = rss{i, 1}.sigma; 
+                    for i = 1:size(ms, 1)
+                       obj.sigma(i) = ms{i, 1}.sigma; 
                     end
+            end    
+            
+            % Find maximum values of D and Dz in the set of regulators
+            obj.D_top = 1;
+            for i = 1:size(obj.regulators, 1)
+               if size(obj.regulators{i}.step_responses, 3) > obj.D_top
+                   obj.D_top = size(obj.regulators{i}.step_responses, 3);
+               end
+            end
+            obj.Dz_top = 0;
+            if size(obj.regulators{1}.z_step_responses, 1) ~= 0
+                for i = 1:size(obj.regulators, 1)
+                   if size(obj.regulators{i}.z_step_responses, 3) > obj.Dz_top
+                       obj.Dz_top = size(obj.regulators{i}.z_step_responses, 3);
+                   end
+                end
             end
             
-            % Crate regulators
-            obj.regulators = cell(size(rss, 1), 1); 
-            for i = 1:size(rss, 1)
-                obj.regulators{i, 1} = DMC(sr_structures{i, 1}, params_structures{i, 1});
-            end
+            % Reset regulator's state
+            obj.reset()
 
         end
         
@@ -209,22 +214,47 @@ classdef FuzzyDMC < handle
         % Computes optimal CV value for the given process' output and
         % desired output on the prediction horizon.
         %
-        % @param y_zad : column vector of ((X * ny) x 1) shape 
-        %        representing desired PVs values for next X discrete
-        %        moments. 
+        % @param y_zad : matrix of (X x ny) shape representing desired 
+        %       PVs values for next X discrete moments. 
         %        If X < N the Y_zad vector is extended to the
         %        X * ny length with the last element of the trajectory
         %        for each PV.
         %        If X > N the Y_zad vector is cut to X*ny.
         %
-        % @param y : vector of actual PVs values
+        % @param y : vector of shape (ny x 1) of actual PVs values
         %
-        % @param z : vector of DVs (required if  number of DVs is > 0)
+        % @param z : vector of shape (ny x 1) of actual DVs values
         %================================================================
         function u = compute(obj, y_zad, y, z)
             
-            % Gathe local CVs
-            cvs = zeros(obj.shape(1), size(obj.regulators, 1));
+            % Check vector sized
+            if size(y_zad, 2) ~= obj.ny
+               error('y_zad vector is of the wrong size'); 
+            end
+            if size(y, 2) ~= obj.ny
+               error('y vector is of the wrong size'); 
+            end
+            
+            % If noise is taken into account update dZp property
+            if obj.Dz_top ~= 0 
+                if exist('z', 'var')
+
+                    % Verify z vector size
+                    if size(z, 1) ~= obj.nz
+                       error('z vector is of the wrong size'); 
+                    end
+
+                    % Circshift dZp vector
+                    obj.dZp = circshift(obj.dZp, obj.nz);
+
+                    % Compute DVs  inreases
+                    obj.dZp(1:obj.nz) = z - obj.zk_1;
+                    
+                end
+            end
+            
+            % Gather local CVs
+            cvs = zeros(obj.nu, size(obj.regulators, 1));
             for i = 1:size(cvs, 1)
                 if exist('z', 'var')
                     cvs(:, i) = obj.regulators{i, 1}.compute(y_zad, y, z); 
@@ -234,14 +264,14 @@ classdef FuzzyDMC < handle
             end
             
             % Compute membership weights
-            memberships = zeros(obj.shape(1), size(obj.regulators, 1));
+            memberships = zeros(obj.nu, size(obj.regulators, 1));
             for i = 1:size(memberships, 1)
                 switch (obj.membership)
                     case 'gaussian'
                         if obj.sets_base == "input"
                             memberships(:, i) = gaussmf(obj.uk_1, [obj.sigma(i), obj.c(i)]);
                         else
-                            memberships(:, i) = gaussmf(y       , [obj.sigma(i), obj.c(i)]);
+                            memberships(:, i) = gaussmf(       y, [obj.sigma(i), obj.c(i)]);
                         end
                 end                
             end
@@ -250,65 +280,116 @@ classdef FuzzyDMC < handle
             wights_sum = sum(memberships, 2);
             
             % Compute CVs
-            u = diag(cvs * memberships') ./ wights_sum;
+            u = sum(cvs .* memberships, 2) ./ wights_sum;
+            
+            % Apply U value constraints
+            for i = 1:obj.nu
+                if u(i) > obj.umax(i)
+                    u(i) = obj.umax(i);
+                elseif u(i) < obj.umin(i)
+                    u(i) = obj.umin(i);
+                end
+            end
+            
+            % Compute CVs delta
+            du = u - obj.uk_1;
+            
+            % Circshift dUp vector
+            obj.dUp = circshift(obj.dUp, obj.nu);
+
+            % Save CVs  inreases
+            obj.dUp(1:obj.nu) = du;
+            for i = 1:size(obj.regulators, 1)
+                obj.regulators{i}.dUp(1:obj.nu) = du;
+            end
             
             % Save actual CVs
-            obj.uk_1 = u;            
-             
+            obj.uk_1 = u;    
+            for i = 1:size(obj.regulators, 1)
+                obj.regulators{i}.uk_1 = obj.uk_1;
+            end
+            if exist('z', 'var')
+                obj.zk_1 = z;
+                for i = 1:size(obj.regulators, 1)
+                    obj.regulators{i}.zk_1 = obj.zk_1;
+                end
+            end 
+            
         end
 
+        %================================================================
+        % Resets regulator's limits and memory to the default state.
+        %================================================================
+        function reset(obj)
+           
+            % Clear memory
+            obj.uk_1_shadow = zeros(obj.nu, 1);
+            obj.zk_1_shadow = zeros(obj.nz, 1);
+            obj.dUp_shadow  = zeros(obj.nu * (obj.D_top - 1), 1);
+            obj.dZp_shadow  = zeros(obj.nz * obj.Dz_top     , 1);
+
+            % Reset limits of controlled variables
+            obj.umin   = ones(obj.nu, 1) * (-Inf);
+            obj.umax   = ones(obj.nu, 1) * Inf;
+            obj.dumin  = ones(obj.nu, 1) * (-Inf);
+            obj.dumax  = ones(obj.nu, 1) * Inf;
+            
+            % Reset subregulators
+            for i = 1:size(obj.regulators, 1)
+                obj.regulators{i}.reset()
+            end
+            
+        end
+        
     end
-    
+        
     %====================================================================
     %%%%%%%%%%%%%%%%%%%%%%%% Getters & setters %%%%%%%%%%%%%%%%%%%%%%%%%%
     %====================================================================
     
     methods
-               
-        function val = get.umin(obj)
-            val = obj.regulators{1}.umin;
-        end
-        function set.umin(obj, umin)
-            for i=1:size(obj.regulators, 1)
-                obj.regulators{i}.umin = umin;
-            end
-        end
-        
-        function val = get.umax(obj)
-            val = obj.regulators{1}.umax;
-        end
-        function set.umax(obj, umax)
-            for i=1:size(obj.regulators, 1)
-                obj.regulators{i}.umax = umax;
-            end
-        end
-        
-        function val = get.dumin(obj)
-            val = obj.regulators{1}.dumin;
-        end
-        function set.dumin(obj, dumin)
-            for i=1:size(obj.regulators, 1)
-                obj.regulators{i}.dumin = dumin;
-            end
-        end
-        
-        function val = get.dumax(obj)
-            val = obj.regulators{1}.dumax;
-        end
-        function set.dumax(obj, dumax)
-            for i=1:size(obj.regulators, 1)
-                obj.regulators{i}.dumax = dumax;
-            end
-        end
         
         function val = get.uk_1(obj)
-            val = obj.regulators{1}.uk_1;
+            val = obj.uk_1_shadow;
         end
         function set.uk_1(obj, uk_1)
+            obj.uk_1_shadow = uk_1;
             for i=1:size(obj.regulators, 1)
-                obj.regulators{i}.uk_1 = uk_1;
+                obj.regulators{i}.uk_1 = obj.uk_1_shadow;
             end
-        end        
+        end   
+        
+        function val = get.zk_1(obj)
+            val = obj.zk_1_shadow;
+        end
+        function set.zk_1(obj, zk_1)
+            obj.zk_1_shadow = zk_1;
+            for i=1:size(obj.regulators, 1)
+                obj.regulators{i}.zk_1 = obj.zk_1_shadow;
+            end
+        end   
+        
+        function val = get.dUp(obj)
+            val = obj.dUp_shadow;
+        end
+        function set.dUp(obj, dUp)
+            obj.dUp_shadow = dUp;
+            for i=1:size(obj.regulators, 1)
+                obj.regulators{i}.dUp = ...
+                    obj.dUp_shadow(1:obj.nu * (obj.regulators{i}.D - 1));
+            end
+        end   
+        
+        function val = get.dZp(obj)
+            val = obj.dUp_shadow;
+        end
+        function set.dZp(obj, dZp)
+            obj.dZp_shadow = dZp;
+            for i=1:size(obj.regulators, 1)
+                obj.regulators{i}.dZp = ...
+                    obj.dZp_shadow(obj.nz * obj.regulators{i}.Dz);
+            end
+        end
     end
     
 end

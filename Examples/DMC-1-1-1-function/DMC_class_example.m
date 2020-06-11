@@ -1,6 +1,6 @@
 %========================================================================
 % File name   : DMC_class_example.m
-% Date        : 27th April 2020
+% Date        : 11th June 2020
 % Author      : Krzysztof Pierczyk
 % Description : Simple example that shows how to use DMC class
 %========================================================================
@@ -15,22 +15,21 @@ clc
 
 % Handle to the function representing object (to see function's
 % requirements @see DMC(...) constructor)
-step_responses_struct.object = @(U, Z)(simulate(U, Z));
+objectStruct.object = @(U, Z)(simulate(U, Z));
 
 % Shape of the object is vector with number of [CVs, DVs, PVs]
-step_responses_struct.shape = [1, 1, 1];
+objectStruct.shape = [1, 1, 1];
 
 % Values of CVs and DVs used to gather step responses
-step_responses_struct.init_point_u = [0];
-step_responses_struct.init_point_z = [0];
+objectStruct.init_point_u = 0;
+objectStruct.init_point_z = 0;
 
 % Sizes of CVs and DVs steps used to gather step responses
-step_responses_struct.step_size_u = [0.2];
-step_responses_struct.step_size_z = [0.2];
+objectStruct.step_size_u = 0.2;
+objectStruct.step_size_z = 0.2;
 
 % Tolerance - @see DMC(...) constructor
-step_responses_struct.tol = 0.0001;
-
+objectStruct.tol = 0.0001;
 
 % The second argument passed to the constructor is structure containing
 % DMC's parameters. Parameters should meet some natural requirements
@@ -42,10 +41,19 @@ param_struct.N      = 100;
 param_struct.Nu     = 30;
 param_struct.D      = 200;
 param_struct.Dz     = 39;
-param_struct.lambda = 0.5;
+lambda              = eye(param_struct.Nu) * 0.5;
+psi                 = eye(param_struct.N)  * 1;
+
+% @note : lambda and psi matrices are not contained in the parameters
+%         struct. It is because they have to be set after initializaing
+%         internal object's model of the regulator. To get more info 
+%         @see DMC doc.
 
 % Now we can create our regulator
-DMC_reg = DMC(step_responses_struct, param_struct);
+DMC_reg = DMC(param_struct);
+DMC_reg.updateModelFunction(objectStruct);
+DMC_reg.lambda = lambda;
+DMC_reg.psi    = psi;
 
 %========================================================================
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%% Simulation %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
@@ -84,7 +92,6 @@ figure
 hold on
 plot(y)
 plot(y_zad)
-
 
 %========================================================================
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%% Cleaning %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%

@@ -9,13 +9,13 @@
 function Y = simulate(U, Z)
 
 % Throw error when vectors' sizes are not equal
-if size(U,2) ~= size(Z,2)
+if size(U,1) ~= size(Z,1)
     error('Lengths of both trajectories are not equal!')
 end
-simulation_time = size(U,2);
+simulation_time = size(U,1);
 
 % Initialize output vector
-Y = zeros(1, simulation_time);
+Y = zeros(simulation_time, 1);
 
 % Simulate
 for i = 1:simulation_time

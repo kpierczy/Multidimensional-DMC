@@ -1,7 +1,7 @@
 %========================================================================
 % File name   : DMC.m
-% Date        : 28th April 2020
-% Version     : 1.0.0
+% Date        : 11th June 2020
+% Version     : 1.2.0
 % Author      : Krzysztof Pierczyk
 % Description : Generic class implementing DMC MIMO regulator. Class
 %               takes into account both controller (CVs) and uncontroller
@@ -19,13 +19,6 @@
 %
 %               Regulator can be configured to take into account 
 %               limitations of input signals.
-%
-% To do list  :
-%
-%    (1) Introduce internall nu and ny values instead of using
-%        size(obj.step_responses, ...)
-%    (2) Introduce 'fi' parameters matrix and extend obj.lambda
-%        to matrxi of parameters
 % 
 %========================================================================
 
@@ -38,16 +31,14 @@ classdef DMC < handle
         Nu     (1, 1) uint32 {mustBeInteger, mustBePositive}
         D      (1, 1) uint32 {mustBeInteger, mustBePositive}
         Dz     (1, 1) uint32 {mustBeInteger, mustBeNonnegative}
-        lambda (1, 1) double {mustBeReal   , mustBeNonnegative}
+        psi    (:, :) double {mustBeReal   , mustBeNonnegative}
+        lambda (:, :) double {mustBeReal   , mustBeNonnegative}
         
-    end
-    
-    properties(SetAccess = private, GetAccess = public)
-       
-        % DMC matrices
-        K   (:, :) double {mustBeReal}
-        Mp  (:, :) double {mustBeReal}
-        Mzp (:, :) double {mustBeReal}
+        % note : 'psi' and 'lambda' can be either scalar or diagonal
+        %        matrices. If they are matrices they have to be of the
+        %        (N*ny) x (N*ny) and (Nu*nu) x (Nu*nu) shape respectively.
+        %        Otherwise, they are extended to they eye(N*ny) and eye(Nu*nu)
+        %        matrices before solving DMC optimisation problem
         
     end
     
@@ -58,8 +49,6 @@ classdef DMC < handle
         umax  (:, 1) double {mustBeReal} =  Inf
         dumin (:, 1) double {mustBeReal} = -Inf
         dumax (:, 1) double {mustBeReal} =  Inf
-
-        
         
         % @note : DMC is an incremental regulator (it computes CVs
         %         increases, not absolute values). To minimize number
@@ -88,6 +77,28 @@ classdef DMC < handle
         
     end
     
+    properties (SetAccess = private, GetAccess = public, Dependent)
+        
+        % DMC matrices
+        K   (:, :) double {mustBeReal}
+        Mp  (:, :) double {mustBeReal}
+        Mzp (:, :) double {mustBeReal}
+        
+        % View on the internal step responses
+        step_responses   (:, :, :) double {mustBeReal}
+        z_step_responses (:, :, :) double {mustBeReal}
+        
+    end
+    
+    properties(SetAccess = private, GetAccess = public)
+               
+        % Object's shape
+        nu uint32 {mustBeNonnegative} = 0
+        nz uint32 {mustBeNonnegative} = 0
+        ny uint32 {mustBeNonnegative} = 0
+        
+    end
+    
     % Internal interface elements
     properties (Access = private)
         
@@ -99,18 +110,19 @@ classdef DMC < handle
         Nu_shadow     (1, 1) uint32 {mustBeInteger, mustBePositive}    = 1
         D_shadow      (1, 1) uint32 {mustBeInteger, mustBePositive}    = 1
         Dz_shadow     (1, 1) uint32 {mustBeInteger, mustBeNonnegative} = 0
-        lambda_shadow (1, 1) double {mustBeReal   , mustBeNonnegative} = 0
+        lambda_shadow (:, :) double {mustBeReal   , mustBeNonnegative} = 0
+        psi_shadow    (:, :) double {mustBeReal   , mustBeNonnegative} = 0
         
         % DMC matrices (internal copies)
-        K_shadow   (:, :) double {mustBeReal}
-        Mp_shadow  (:, :) double {mustBeReal}
-        Mzp_shadow (:, :) double {mustBeReal}
+        K_shadow   (:, :) double {mustBeReal} = 0
+        Mp_shadow  (:, :) double {mustBeReal} = 0
+        Mzp_shadow (:, :) double {mustBeReal} = 0
         
         % Recently saved step responses
-        step_responses (:, :, :) double {mustBeReal}
+        step_responses_shadow (:, :, :) double {mustBeReal} = 0
         
         % Recently saved step responses of the output-disturbance tracks
-        z_step_responses (:, :, :) double {mustBeReal}
+        z_step_responses_shadow (:, :, :) double {mustBeReal} = 0
         
     end
     
@@ -124,7 +136,203 @@ classdef DMC < handle
         %================================================================
         % DMC regulator initialization. 
         % 
-        % @param step_responses_struct : Structure containing information
+        % @param param_struct : structure containing DMC parameters
+        %
+        %        .N - prediction horizon; positive integer value.
+        %             If .N is greater than dynamic rank .D (see below)
+        %             it is set to .D
+        %
+        %        .Nu - control horizon; positive integer value.
+        %             If .Nu is greater than dynamic rank .D (see below)
+        %             it is set to .D
+        %
+        %        .D - dynamic rank; positive integer value.
+        %             If .D is greater than stabilization period of
+        %             the slowest CV-PV track it is cut to the value
+        %             of this period
+        %
+        %        .Dz - disturbance dynamic rank; non-negative integer 
+        %             value. If .Dz is greater than stabilization period 
+        %             of the slowest DV-PV track it is cut to the value
+        %             of this period.
+        %             If .Dz is set to 0 DV-PV tracks are not taken
+        %             into account in regulation process
+        %
+        % @note : calculating optimal DMC matrices requires 'lambda' and
+        %         'psi' diagonal matrices containing weights for adjusting
+        %         balance between importance of particular output's
+        %         stabilization and variance of the CVs. These are by
+        %         default set to eye(Nu * nu) and eye(N * ny). It is
+        %         because given horizonts (N, Nu) can turn out to be greater
+        %         that the maximal time of outputs stabilization during
+        %         model's initialization process. In this case they are
+        %         trimmed so given 'lambda' and 'psi' matrices would be
+        %         of the wrong size. 
+        %         After initialization of the internal model actual N
+        %         and Nu values can be checked and proper materices can
+        %         be set using '.' operator
+        %
+        % @note : parameters are set in constructor but object remains
+        %         uninitialized up to the first call of updateModel() or
+        %         updateModelFunction() method
+        %
+        % @note : class does not controll size of the .lambda and .psi
+        %         matrices. They should be set to appropriate sizes
+        %         by the user
+        %================================================================
+        function obj = DMC(param_struct)
+            
+            % Initial parameters verification
+            mustBeInteger(param_struct.N);
+            mustBePositive(param_struct.N);
+            mustBeInteger(param_struct.Nu);
+            mustBePositive(param_struct.Nu);
+            mustBeInteger(param_struct.D);
+            mustBePositive(param_struct.D);
+            mustBeInteger(param_struct.Dz);
+            mustBeNonnegative(param_struct.D);
+            
+            % Initialize DMC parameters
+            obj.D_shadow      = param_struct.D; 
+            obj.Dz_shadow     = param_struct.Dz;
+            obj.N_shadow      = param_struct.N;
+            obj.Nu_shadow     = param_struct.Nu;
+            obj.lambda_shadow = 1;
+            obj.psi_shadow    = 1;
+            
+        end
+        
+        %================================================================
+        % Function (re)initializes regulator using set of the step
+        % responses. Responses can be raw signals taken from the object.
+        % If so, they are scaled by the function wth respect to given
+        % scaling parameters).
+        %
+        % @param stepResponsesStruct - structure containing all
+        %        informations eqruired to initialize DMC step responses:
+        %
+        %        .stepResponses - cell aray of size (nu x ny). Each cell
+        %             contains step response of the corresponding input-
+        %             output track. A step response is the column vector.
+        %
+        %        .zStepResonses - cell aray of size (nz x ny). Each cell
+        %             contains step response of the corresponding 
+        %             disturbance - output track. A step response is the
+        %             column vector.
+        %
+        %        .workPoint (optional, default 0) - vector of size
+        %             (ny x 1) containng values of the outputs in the work
+        %             point that step responses were acquired from
+        %
+        %         .stepSize (optional, default 1) - vector of size
+        %             (nu x 1) containng values of the inputs steps used
+        %             to gather step responses
+        %
+        %         .zStepSize (optional, default 1) - vector of size
+        %             (nz x 1) containng values of the disturbances steps 
+        %             used to gather step responses        
+        %         
+        % @note given step responses are onlly scaled by values and
+        %       prolonged to the longest's response length. They are no 
+        %       trimmed from the beggining and end. It is user's duty to
+        %       do that
+        %
+        %================================================================
+        function updateModel(obj, stepResponsesStruct)
+            
+            % Alias argument's name
+            srs = stepResponsesStruct;
+            
+            % Set object's size
+            obj.nu = size(srs.stepResponses, 1);
+            obj.ny = size(srs.stepResponses, 2);
+            
+            % Establish value of the longest response
+            D_t = 0;
+            for u = 1:obj.nu
+                for y = 1:obj.ny
+                    if size(srs.stepResponses{u, y}, 1) > D_t
+                        D_t = size(srs.stepResponses{u, y}, 1);
+                    end
+                end
+            end
+            
+            % Establish scaling factors
+            if ~isfield(srs, 'workPoint')
+                srs.workPoint = zeros(obj.ny, 1);
+            end
+            if ~isfield(srs, 'stepSize')
+                srs.stepSize = ones(obj.nu, 1);
+            end
+            
+            % Extend step responses to a dynamic rank value
+            obj.step_responses_shadow = zeros(obj.nu, obj.ny, D_t);
+            for u = 1:obj.nu
+                for y = 1:obj.ny
+                    length = size(srs.stepResponses{u, y}, 1);
+                    obj.step_responses_shadow(u, y, 1:length) = ...
+                        (srs.stepResponses{u, y} - srs.workPoint(y)) / srs.stepSize(u);
+                    obj.step_responses_shadow(u, y, length:end) = obj.step_responses_shadow(u, y, length);
+                end
+            end
+            
+            % If disturbance inputs present
+            if isfield(srs, 'zStepResponses')
+                
+                % Set number of disturbance inputs
+                obj.nz = size(srs.zStepResponses, 1);
+            
+                % Establish value of the longest response
+                Dz_t = 0;
+                for z = 1:obj.nz
+                    for y = 1:obj.ny
+                        if size(srs.zStepResponses{z, y}, 1) > Dz_t
+                            Dz_t = size(srs.zStepResponses{z, y}, 1);
+                        end
+                    end
+                end
+
+                % Set step sizes
+                if ~isfield(srs, 'zStepSize')
+                    srs.zStepSize = ones(obj.nz, 1);
+                end
+
+                % Extend step responses to a dynamic rank value
+                obj.z_step_responses_shadow = zeros(obj.nu, obj.ny, Dz_t);
+                for z = 1:obj.nz
+                    for y = 1:obj.ny
+                        length = size(srs.zStepResponses{z, y}, 1);
+                        obj.z_step_responses_shadow(z, y, 1:length) = ...
+                            (srs.zStepResponses{z, y} - srs.workPoint(y)) / srs.zStepSize(z);
+                        obj.z_step_responses_shadow(z, y, length:end) = obj.z_step_responses_shadow(z, y, length);
+                    end
+                end
+                
+            else
+                
+                obj.Dz_shadow = 0;
+                obj.z_step_responses_shadow = [];
+                
+            end
+            
+            % Set regulator initialized 
+            obj.initialized = true;
+            
+            % Reset internal
+            obj.verify_params();
+            obj.solve();
+            obj.reset();
+            
+        end
+        
+        
+        %================================================================
+        % Function (re)initializes regulator using the function function
+        % representing regulated object. It performs appropriate actions
+        % to gether step responses and solve DMC optimisation problem
+        % with them
+        %
+        % @param objectStruct : Structure containing information
         %        used to gather all required step responses. 
         %        The structure should containt following field:
         %
@@ -132,11 +340,13 @@ classdef DMC < handle
         %                  or "function Y = f(U, Z) function representing 
         %                  regulated object. It should take two 2D arrays
         %                  representing CVs and DVs signals (matrices'
-        %                  rows refer to a single CV/DV). It should return 
-        %                  output for moments from k = 1 to
-        %                  k = (size(input))
+        %                  columns refer to a single CV/DV, when rows
+        %                  contain signals valyes in subsequent discrete
+        %                  moments). It should return output matrix of
+        %                  size 'size(U, 1) x number of outputs' 
+        %                  containing 'size(U, 1)' samples of outputs
         %
-        %                  If number of columns of U and Z matrices are
+        %                  If number of rows of U and Z matrices are
         %                  not equal, function should throw an error.
         %
         %        .shape  - [nu, nz, ny] array containing object's 
@@ -160,7 +370,10 @@ classdef DMC < handle
         %
         %        .tol (optional, defaul = 0.0001) - maximum difference
         %                  between two values (e.g. subsequent output
-        %                  values) that can be approximated as 0
+        %                  values) that can be approximated as 0. This
+        %                  value is used during step responses gathering
+        %                  to establish whether the object's output is
+        %                  stabilized
         %
         %        .sim_time (optional, default = 1000) - length of the
         %                  simulation used to get step responses
@@ -171,76 +384,6 @@ classdef DMC < handle
         %         two subsequent values of all outputs are smaller than 
         %         .tol
         %
-        %
-        % @param param_struct : structure containing DMC parameters
-        %
-        %        .N - prediction horizon; positive integer value.
-        %             If .N is greater than dynamic rank .D (see below)
-        %             it is set to .D
-        %
-        %        .Nu - control horizon; positive integer value.
-        %             If .Nu is greater than dynamic rank .D (see below)
-        %             it is set to .D
-        %
-        %        .D - dynamic rank; positive integer value.
-        %             If .D is greater than stabilization period of
-        %             the slowest CV-PV track it is cut to the value
-        %             of this period
-        %
-        %        .Dz - disturbance dynamic rank; non-negative integer 
-        %             value. If .Dz is greater than stabilization period 
-        %             of the slowest DV-PV track it is cut to the value
-        %             of this period.
-        %             If .Dz is set to 0 DV-PV tracks are not taken
-        %             into account in regulation process
-        %
-        %         .lambda - non-negative real value controlling 
-        %             punishment for the CVs changes during optimisation
-        %             process
-        %================================================================
-        function obj = DMC(step_responses_struct, param_struct)
-            
-            % Initial parameters verification
-            mustBeInteger(param_struct.N);
-            mustBePositive(param_struct.N);
-            mustBeInteger(param_struct.Nu);
-            mustBePositive(param_struct.Nu);
-            mustBeInteger(param_struct.D);
-            mustBePositive(param_struct.D);
-            mustBeInteger(param_struct.Dz);
-            mustBeNonnegative(param_struct.D);
-            mustBeReal(param_struct.lambda);
-            mustBeNonnegative(param_struct.lambda);
-            
-            
-            % Gather step responses
-            obj.update_model(step_responses_struct)
-            
-            % Initialize DMC parameters
-            obj.D_shadow      = param_struct.D; 
-            obj.Dz_shadow     = param_struct.Dz;
-            obj.N_shadow      = param_struct.N;
-            obj.Nu_shadow     = param_struct.Nu;
-            obj.lambda_shadow = param_struct.lambda;
-            obj.verify_params();
-            
-            % Reset limits and memory after parameters asignment
-            obj.reset();
-            
-            % Mark object initialized
-            obj.initialized = true;
-            
-            % Compute DMC matrices
-            obj.solve();
-            
-        end
-        
-        %================================================================
-        % Function changes saved step responses basing on the new model 
-        % of the object.
-        %
-        % @param step_responses_struct : @see DMC(...)
-        %
         % @note : If DMC parameters doesn't meet requirements described
         %         in the constructor's commet they are modified as
         %         described above (@see DMC(...))
@@ -249,127 +392,131 @@ classdef DMC < handle
         %         are set to zero and should be updated after method's
         %         call if required. All limits are discarded.
         %================================================================
-        function update_model(obj, step_responses_struct)
-            
-            % Alias argument's name
-            srs = step_responses_struct;
+        function updateModelFunction(obj, objectStruct)
             
             % Compute step responses for CV-PV tracks
-            step_responses_t   = cell(srs.shape(1), srs.shape(3));
-            dynamic_rank = 0;
-            for u = 1:srs.shape(1)
-                for y = 1:srs.shape(3)
+            step_responses_shadow_t   = cell(objectStruct.shape(1), objectStruct.shape(3));
+            D_t = 0;
+            for u = 1:objectStruct.shape(1)
+                
+                % Prepare SIMO bind
+                bind_struct.object     = objectStruct.object;
+                bind_struct.shape      = objectStruct.shape;
+                bind_struct.U          = objectStruct.init_point_u;
+                if isfield(objectStruct, 'init_point_z')
+                    bind_struct.Z      = objectStruct.init_point_z;
+                else
+                    bind_struct.Z      = [];
+                end                    
+                bind_struct.input_num  = u;
+                bind_struct.input_type = 'CV';
+
+                % Initialize structure for single step response calculation
+                srs_SIMO.object = @(input)(DMC.bind(bind_struct, input));
+                srs_SIMO.init_point = objectStruct.init_point_u(u);
+                srs_SIMO.step_size  = objectStruct.step_size_u(u);
+                if isfield(objectStruct, 'tol')
+                    srs_SIMO.tol = objectStruct.tol;
+                end
+                if isfield(objectStruct, 'sim_time')
+                    srs_SIMO.sim_time = sobjectStructrs.sim_time;
+                end
+
+                % Compute step response
+                step_responses_SIMO = DMC.step_response_SIMO(srs_SIMO);
+                for y = 1:objectStruct.shape(3)
                     
-                    % Prepare SISO bind
-                    bind_struct.object     = srs.object;
-                    bind_struct.shape      = srs.shape;
-                    bind_struct.U          = srs.init_point_u;
-                    if isfield(srs, 'init_point_z')
-                        bind_struct.Z      = srs.init_point_z;
-                    else
-                        bind_struct.Z      = [];
-                    end                    
-                    bind_struct.input_num  = u;
-                    bind_struct.output_num = y;
-                    bind_struct.input_type = 'CV';
-                    
-                    % Initialize structure for single step response calculation
-                    srs_SISO.object = @(input)(DMC.bind(bind_struct, input));
-                    srs_SISO.init_point = srs.init_point_u(u);
-                    srs_SISO.step_size  = srs.step_size_u(u);
-                    if isfield(srs, 'tol')
-                        srs_SISO.tol = srs.tol;
-                    end
-                    if isfield(srs, 'sim_time')
-                        srs_SISO.sim_time = srs.sim_time;
-                    end
-                    
-                    % Compute step response
-                    step_responses_t{u, y} = DMC.step_response_SISO(srs_SISO);
+                    step_responses_shadow_t{u, y} = step_responses_SIMO(:, y);
                     
                     % Update dynamic_rank
-                    if size(step_responses_t{u, y}, 2) > dynamic_rank
-                        dynamic_rank = size(step_responses_t{u, y}, 2);
+                    if size(step_responses_shadow_t{u, y}, 1) > D_t
+                        D_t = size(step_responses_shadow_t{u, y}, 1);
                     end
-                    
                 end
+
             end
             
             % Extend step responses to a dynamic rank value
-            obj.D_shadow = dynamic_rank;
-            obj.step_responses = zeros(srs.shape(1), srs.shape(3), obj.D);
-            for u = 1:srs.shape(1)
-                for y = 1:srs.shape(3)
-                    length = size(step_responses_t{u, y}, 2);
-                    obj.step_responses(u, y, 1:length) = step_responses_t{u, y};
-                    obj.step_responses(u, y, length:end) = obj.step_responses(u, y, length);
+            obj.step_responses_shadow = zeros(objectStruct.shape(1), objectStruct.shape(3), D_t);
+            for u = 1:objectStruct.shape(1)
+                for y = 1:objectStruct.shape(3)
+                    length = size(step_responses_shadow_t{u, y}, 1);
+                    obj.step_responses_shadow(u, y, 1:length) = step_responses_shadow_t{u, y};
+                    obj.step_responses_shadow(u, y, length:end) = obj.step_responses_shadow(u, y, length);
                 end
             end
             
             % Check if DVs are taken into account
-            if srs.shape(2) ~= 0
+            if objectStruct.shape(2) ~= 0
 
                 % Compute step responses for DV-PV tracks
-                z_step_responses_t = cell(srs.shape(2), srs.shape(3));
-                z_dynamic_rank = 0;
-                for z = 1:srs.shape(2)
-                    for y = 1:srs.shape(3)
-                        
-                        % Prepare SISO bind
-                        bind_struct.object     = srs.object;
-                        bind_struct.shape      = srs.shape;
-                        bind_struct.U          = srs.init_point_u;
-                        bind_struct.Z          = srs.init_point_z;
-                        bind_struct.input_num  = z;
-                        bind_struct.output_num = y;
-                        bind_struct.input_type = 'DV';
-                        
-                        % Initialize structure for single step response calculation
-                        srs_SISO.object = @(input)(DMC.bind(bind_struct, input));
-                        srs_SISO.init_point = srs.init_point_z(z);
-                        srs_SISO.step_size  = srs.step_size_z(z);
-                        if isfield(srs, 'tol')
-                            srs_SISO.tol = srs.tol;
-                        end
-                        if isfield(srs, 'sim_time')
-                            srs_SISO.sim_time = srs.sim_time;
-                        end
-                        
-                        % Compute step response
-                        z_step_responses_t{z, y} = DMC.step_response_SISO(srs_SISO);
-                        
-                        % Update dynamic_rank
-                        if size(z_step_responses_t{z, y}, 2) > z_dynamic_rank
-                            z_dynamic_rank = size(z_step_responses_t{z, y}, 2);
-                        end
-                        
+                z_step_responses_shadow_t = cell(objectStruct.shape(2), objectStruct.shape(3));
+                Dz_t = 0;
+                for z = 1:objectStruct.shape(2)
+
+                    % Prepare SIMO bind
+                    bind_struct.object     = objectStruct.object;
+                    bind_struct.shape      = objectStruct.shape;
+                    bind_struct.U          = objectStruct.init_point_u;
+                    bind_struct.Z          = objectStruct.init_point_z;
+                    bind_struct.input_num  = z;
+                    bind_struct.output_num = y;
+                    bind_struct.input_type = 'DV';
+
+                    % Initialize structure for single step response calculation
+                    srs_SIMO.object = @(input)(DMC.bind(bind_struct, input));
+                    srs_SIMO.init_point = objectStruct.init_point_z(z);
+                    srs_SIMO.step_size  = objectStruct.step_size_z(z);
+                    if isfield(objectStruct, 'tol')
+                        srs_SIMO.tol = objectStruct.tol;
                     end
+                    if isfield(objectStruct, 'sim_time')
+                        srs_SIMO.sim_time = objectStruct.sim_time;
+                    end
+
+                    % Compute step response
+                    z_step_responses_SIMO = DMC.step_response_SIMO(srs_SIMO);
+                    for y = 1:objectStruct.shape(3)
+
+                        z_step_responses_shadow_t{z, y} = z_step_responses_SIMO(:, y);
+
+                        % Update dynamic_rank
+                        if size(z_step_responses_shadow_t{z, y}, 1) > Dz_t
+                            Dz_t = size(z_step_responses_shadow_t{z, y}, 1);
+                        end
+                    end
+
                 end
                 
                 % Extend step responses to a disturbance dynamic rank value
-                obj.Dz_shadow = z_dynamic_rank;
-                obj.z_step_responses = zeros(srs.shape(2), srs.shape(3), obj.Dz);
-                for z = 1:srs.shape(2)
-                    for y = 1:srs.shape(3)
-                        length = size(z_step_responses_t{z, y}, 2);
-                        obj.z_step_responses(z, y, 1:length) = z_step_responses_t{z, y};
-                        obj.z_step_responses(z, y, length:end) = obj.z_step_responses(z, y, length);
+                obj.z_step_responses_shadow = zeros(objectStruct.shape(2), objectStruct.shape(3), Dz_t);
+                for z = 1:objectStruct.shape(2)
+                    for y = 1:objectStruct.shape(3)
+                        length = size(z_step_responses_shadow_t{z, y}, 1);
+                        obj.z_step_responses_shadow(z, y, 1:length) = z_step_responses_shadow_t{z, y};
+                        obj.z_step_responses_shadow(z, y, length:end) = obj.z_step_responses_shadow(z, y, length);
                     end
                 end
 
             else
                 
                 obj.Dz_shadow = 0;
-                obj.z_step_responses = [];
+                obj.z_step_responses_shadow = [];
 
             end
             
-            % Reset some parameters if object was used yet
-            if obj.initialized
-                obj.verify_params();
-                obj.solve();
-                obj.reset();
-            end
+            % Set auxiliary values of object's shape
+            obj.nu = size(obj.step_responses_shadow, 1);
+            obj.nz = size(obj.z_step_responses_shadow, 1);
+            obj.ny = size(obj.step_responses_shadow, 2);
+            
+            % Set regulator initialized 
+            obj.initialized = true;
+            
+            % Reset internal
+            obj.verify_params();
+            obj.solve();
+            obj.reset();
             
         end
         
@@ -377,7 +524,7 @@ classdef DMC < handle
         % Computes optimal CV value for the given process' output and
         % desired output on the prediction horizon.
         %
-        % @param y_zad : matrix of size (ny x X) representing desired 
+        % @param y_zad : matrix of size (X x ny) representing desired 
         %        PVs values for next X discrete moments. Rows of the
         %        matrix refer to subsequent outputs when columns mark
         %        discrete moments.
@@ -386,17 +533,17 @@ classdef DMC < handle
         %        for each PV.
         %        If X > N the Y_zad vector is cut to X*ny.
         %
-        % @param y : vector of actual PVs values
+        % @param y : vector of shape (ny x 1) of actual PVs values
         %
-        % @param z : vector of DVs
+        % @param z : vector of shape (nz x 1) of actual DVs values
         %================================================================
         function u = compute(obj, y_zad, y, z)
-            
+               
             % Check vector sized
-            if size(y_zad, 1) ~= size(obj.step_responses, 2)
+            if size(y_zad, 2) ~= obj.ny
                error('y_zad vector is of the wrong size'); 
             end
-            if size(y, 1) ~= size(obj.step_responses, 2)
+            if size(y, 2) ~= obj.ny
                error('y vector is of the wrong size'); 
             end
             
@@ -405,31 +552,31 @@ classdef DMC < handle
                 if exist('z', 'var')
 
                     % Verify z vector size
-                    if size(z, 1) ~= size(obj.z_step_responses, 1)
+                    if size(z, 1) ~= obj.nz
                        error('z vector is of the wrong size'); 
                     end
 
                     % Circshift dZp vector
-                    obj.dZp = circshift(obj.dZp, size(obj.z_step_responses, 1));
+                    obj.dZp = circshift(obj.dZp, obj.nz);
 
                     % Compute DVs  inreases
-                    obj.dZp(1:size(obj.z_step_responses, 1)) = z - obj.zk_1;
+                    obj.dZp(1:obj.nz) = z - obj.zk_1;
                     
                 end
             end
                 
             % Initialize reshaped y_zad vector
-            Y_zad = zeros(obj.N * size(obj.step_responses, 2), 1);
+            Y_zad = zeros(obj.N * obj.ny, 1);
             
             % Reshape and cut y_zad vector
-            if size(y_zad, 2) > obj.N
+            if size(y_zad, 1) > obj.N
                 
                 % Fill reshaped y_zad vector
                 for i = 1:obj.N
                    Y_zad( ...
-                       (i - 1) * size(obj.step_responses, 2) + 1 : ...
-                            i  * size(obj.step_responses, 2)       ...
-                    ) = y_zad(:, i);
+                       (i - 1) * obj.ny + 1 : ...
+                            i  * obj.ny       ...
+                    ) = y_zad(i, :)';
                        
                 end
 
@@ -437,31 +584,31 @@ classdef DMC < handle
             else
                 
                 % Reshape y_zad
-                for i = 1:size(y_zad, 2)
+                for i = 1:size(y_zad, 1)
                    Y_zad( ...
-                       (i - 1) * size(obj.step_responses, 2) + 1 : ...
-                            i  * size(obj.step_responses, 2)       ...
-                    ) = y_zad(:, i);
+                       (i - 1) * obj.ny + 1 : ...
+                            i  * obj.ny       ...
+                    ) = y_zad(i, :)';
                 end
                 
                 % Extend y_zad
-                if size(y_zad, 2) < obj.N
-                    for i = size(y_zad, 2):obj.N
+                if size(y_zad, 1) < obj.N
+                    for i = size(y_zad, 1):obj.N
                         Y_zad( ...
-                            (i - 1) * size(obj.step_responses, 2) + 1 : ...
-                                 i  * size(obj.step_responses, 2)       ...
-                         ) = y_zad(:, end);
+                            (i - 1) * obj.ny + 1 : ...
+                                 i  * obj.ny       ...
+                         ) = y_zad(end, :)';
                     end
                 end
             end
             
             % Validate y vector
-            if size(y, 1) ~= size(obj.step_responses, 2)
+            if size(y, 2) ~= obj.ny
                error('Too few output values given!') 
             end
             
             % Create Y vector
-            Y = repmat(y, obj.N, 1);
+            Y = repmat(y', obj.N, 1);
         
             %---------------- Regulation law computation -----------------
             
@@ -473,12 +620,9 @@ classdef DMC < handle
             end
             
             % Compute CVs increases
-            dU = obj.K(1:size(obj.step_responses, 1), :) * (Y_zad - Y_0);
+            du = obj.K(1:obj.nu, :) * (Y_zad - Y_0);
             
-            %------------------------------------------------------------
-            
-            % Get CVs increases for this iteration only
-            du = dU(1:size(obj.step_responses, 1));            
+            %------------------------------------------------------------            
             
             % Apply dU value constraints
             for i = 1:size(du)
@@ -490,16 +634,16 @@ classdef DMC < handle
             end
 
             % Circshift dUp vector
-            obj.dUp = circshift(obj.dUp, size(obj.step_responses, 1));
+            obj.dUp = circshift(obj.dUp, obj.nu);
 
             % Save CVs  inreases
-            obj.dUp(1:size(obj.step_responses, 1)) = du;
+            obj.dUp(1:obj.nu) = du;
             
             % Compute CVs
             u = obj.uk_1 + du;
             
             % Apply U value constraints
-            for i = 1:size(obj.step_responses, 1)
+            for i = 1:obj.nu
                 if u(i) > obj.umax(i)
                     u(i) = obj.umax(i);
                 elseif u(i) < obj.umin(i)
@@ -522,16 +666,16 @@ classdef DMC < handle
         function reset(obj)
            
             % Clear memory
-            obj.uk_1 = zeros(size(obj.step_responses  , 1), 1);
-            obj.zk_1 = zeros(size(obj.z_step_responses, 1), 1);
-            obj.dUp  = zeros(size(obj.step_responses  , 1) * (obj.D - 1), 1);
-            obj.dZp  = zeros(size(obj.z_step_responses, 1) * obj.Dz     , 1);
+            obj.uk_1 = zeros(obj.nu, 1);
+            obj.zk_1 = zeros(obj.nz, 1);
+            obj.dUp  = zeros(obj.nu * (obj.D - 1), 1);
+            obj.dZp  = zeros(obj.nz * obj.Dz     , 1);
 
             % Reset limits of controlled variables
-            obj.umin   = ones(size(obj.step_responses, 1), 1) * (-Inf);
-            obj.umax   = ones(size(obj.step_responses, 1), 1) * Inf;
-            obj.dumin  = ones(size(obj.step_responses, 1), 1) * (-Inf);
-            obj.dumax  = ones(size(obj.step_responses, 1), 1) * Inf;
+            obj.umin   = ones(obj.nu, 1) * (-Inf);
+            obj.umax   = ones(obj.nu, 1) * Inf;
+            obj.dumin  = ones(obj.nu, 1) * (-Inf);
+            obj.dumax  = ones(obj.nu, 1) * Inf;
             
         end
         
@@ -556,25 +700,27 @@ classdef DMC < handle
             modified = false;
                         
             % Initialize DMC parameters
-            if obj.D > size(obj.step_responses, 3)
-                obj.D_shadow =  size(obj.step_responses, 3);
+            if obj.D > size(obj.step_responses_shadow, 3)
+                obj.D_shadow =  size(obj.step_responses_shadow, 3);
                 modified = true;
             end
             
-            if obj.Dz > size(obj.z_step_responses, 3)
-                obj.Dz_shadow = size(obj.z_step_responses, 3);
+            if obj.Dz > size(obj.z_step_responses_shadow, 3)
+                obj.Dz_shadow = size(obj.z_step_responses_shadow, 3);
                 modified = true;
-            elseif obj.Dz > 0 && size(obj.z_step_responses, 1) == 0
+            elseif obj.Dz > 0 && obj.nz == 0
                 obj.Dz_shadow = 0;
                 modified = true;
             end
             
             if obj.N > obj.D
+                warning('N changed! Psi can be of the wrong size!')
                 obj.N_shadow =  obj.D;
                 modified = true;
             end
             
             if obj.Nu > obj.D
+                warning('Nu changed! Lambda can be of the wrong size!')
                 obj.Nu_shadow =  obj.D;
                 modified = true;
             end        
@@ -590,8 +736,8 @@ classdef DMC < handle
 
             % Initialize M matrix
             M  = zeros( ...
-                    size(obj.step_responses, 2) * obj.N, ...
-                    size(obj.step_responses, 1) * obj.Nu ...
+                    obj.ny * obj.N, ...
+                    obj.nu * obj.Nu ...
                  );
             for i = 1:obj.N
                 for j = 1:obj.Nu
@@ -601,8 +747,8 @@ classdef DMC < handle
                         S = obj.S(i - j + 1);
                         
                         % Fill field in M matrix
-                        M((i-1)*size(obj.step_responses, 2) + 1 : i*size(obj.step_responses, 2), ...
-                          (j-1)*size(obj.step_responses, 1) + 1 : j*size(obj.step_responses, 1)) = S;
+                        M((i-1)*obj.ny + 1 : i*obj.ny, ...
+                          (j-1)*obj.nu + 1 : j*obj.nu) = S;
                       
                     end
                 end
@@ -610,8 +756,8 @@ classdef DMC < handle
 
             % Initialize Mp matrix
             obj.Mp = zeros( ...
-                        size(obj.step_responses, 2) * obj.N,     ...
-                        size(obj.step_responses, 1) *(obj.D - 1) ...
+                        obj.ny * obj.N,     ...
+                        obj.nu *(obj.D - 1) ...
                      );
             for j = 1:(obj.D - 1)
                 
@@ -624,8 +770,8 @@ classdef DMC < handle
                     S = obj.S(i+j);
                     
                     % Fill Mp's field with Ss' difference
-                    obj.Mp((i-1)*size(obj.step_responses, 2) + 1 : i*size(obj.step_responses, 2), ...
-                           (j-1)*size(obj.step_responses, 1) + 1 : j*size(obj.step_responses, 1)) = S - Sj;
+                    obj.Mp((i-1)*obj.ny + 1 : i*obj.ny, ...
+                           (j-1)*obj.nu + 1 : j*obj.nu) = S - Sj;
 
                 end
             end
@@ -634,8 +780,8 @@ classdef DMC < handle
             % Initialize Mzp matrix
             if obj.Dz ~= 0
                 obj.Mzp = zeros(....
-                              size(obj.step_responses,   2) * obj.N, ...
-                              size(obj.z_step_responses, 1) * obj.Dz ...
+                              size(obj.step_responses_shadow,   2) * obj.N, ...
+                              obj.nz * obj.Dz ...
                           );
                for j = 1:obj.Dz
 
@@ -651,11 +797,11 @@ classdef DMC < handle
 
                         % Fill Mzp's field with Ss' difference
                         if j > 1
-                            obj.Mzp((i-1)*size(obj.step_responses, 2) + 1 : i*size(obj.step_responses, 2), ...
-                                    (j-1)*size(obj.step_responses, 1) + 1 : j*size(obj.step_responses, 1)) = S - Sj;
+                            obj.Mzp((i-1)*obj.ny + 1 : i*obj.ny, ...
+                                    (j-1)*obj.nu + 1 : j*obj.nu) = S - Sj;
                         else
-                            obj.Mzp((i-1)*size(obj.step_responses, 2) + 1 : i*size(obj.step_responses, 2), ...
-                                    (j-1)*size(obj.step_responses, 1) + 1 : j*size(obj.step_responses, 1)) = S;
+                            obj.Mzp((i-1)*obj.ny + 1 : i*obj.ny, ...
+                                    (j-1)*obj.nu + 1 : j*obj.nu) = S;
                         end
 
                     end
@@ -663,9 +809,22 @@ classdef DMC < handle
             else
                 obj.Mzp = [];
             end
+            
+            % If 'lambda' and 'psi' parameters are given with scalars,
+            % extend them to matrices
+            if size(obj.lambda, 1) == 1
+                lambda_t = eye(obj.Nu * obj.nu) * obj.lambda; 
+            else
+                lambda_t = obj.lambda;               
+            end
+            if size(obj.psi, 1) == 1
+                psi_t = eye(obj.N * obj.ny) * obj.psi; 
+            else
+                psi_t = obj.psi;
+            end
              
             % Solve optimization problem
-            obj.K = (M' * M + obj.lambda * eye(size(obj.step_responses, 1) * obj.Nu))^(-1) * M';
+            obj.K = (M' * psi_t * M + lambda_t)^(-1) * M' * psi_t;
         end
         
         %================================================================
@@ -675,17 +834,17 @@ classdef DMC < handle
         % @param l : index of the samples
         %================================================================
         function S_l = S(obj, l)
-            S_l = zeros(size(obj.step_responses, 2), size(obj.step_responses, 1));
+            S_l = zeros(obj.ny, obj.nu);
             if l <= obj.D
-                for y = 1:size(obj.step_responses, 2)
-                    for u = 1:size(obj.step_responses, 1)
-                        S_l(y, u) = obj.step_responses(u, y, l);
+                for y = 1:obj.ny
+                    for u = 1:obj.nu
+                        S_l(y, u) = obj.step_responses_shadow(u, y, l);
                     end
                 end
             else
-                for y = 1:size(obj.step_responses, 2)
-                    for u = 1:size(obj.step_responses, 1)
-                        S_l(y, u) = obj.step_responses(u, y, obj.D);
+                for y = 1:obj.ny
+                    for u = 1:obj.nu
+                        S_l(y, u) = obj.step_responses_shadow(u, y, obj.D);
                     end
                 end
             end
@@ -698,17 +857,17 @@ classdef DMC < handle
         % @param l : index of the samples
         %================================================================
         function Sz_l = Sz(obj, l)
-            Sz_l = zeros(size(obj.z_step_responses, 2), size(obj.z_step_responses, 1));
+            Sz_l = zeros(size(obj.z_step_responses_shadow, 2), obj.nz);
             if l <= obj.Dz
-                for y = 1:size(obj.z_step_responses, 2)
-                    for z = 1:size(obj.z_step_responses, 1)
-                        Sz_l(y, z) = obj.z_step_responses(z, y, l);
+                for y = 1:size(obj.z_step_responses_shadow, 2)
+                    for z = 1:obj.nz
+                        Sz_l(y, z) = obj.z_step_responses_shadow(z, y, l);
                     end
                 end
             else
-                for y = 1:size(obj.z_step_responses, 2)
-                    for z = 1:size(obj.z_step_responses, 1)
-                        Sz_l(y, z) = obj.z_step_responses(z, y, obj.Dz);
+                for y = 1:size(obj.z_step_responses_shadow, 2)
+                    for z = 1:obj.nz
+                        Sz_l(y, z) = obj.z_step_responses_shadow(z, y, obj.Dz);
                     end
                 end
             end
@@ -720,7 +879,7 @@ classdef DMC < handle
         
         %================================================================
         % Computes step response suitable to use with DMC algorithm
-        % for a single input - single output track.
+        % for a single input - multiple output track.
         %
         % @param step_responses_struct : Structure containing information
         %        used to gather all required step responses. 
@@ -752,7 +911,7 @@ classdef DMC < handle
         %         two subsequent values the output is smaller than 
         %         .tol
         %================================================================
-        function Y = step_response_SISO(step_response_struct)
+        function Y = step_response_SIMO(step_response_struct)
 
             % Alias argument's name
             srs = step_response_struct;
@@ -773,37 +932,57 @@ classdef DMC < handle
                 sim_time = 1000;
             end
 
-
             % Search the work point
-            U = ones(1, sim_time) * srs.init_point;
+            U = ones(sim_time, 1) * srs.init_point;
             Y = srs.object(U);
 
             % Get a stabilization time and work point
-            stabilization_time = find(abs(Y - Y(end)) < tol, 1, 'first');
-            if isempty(stabilization_time)
-               error("Object's track could not be stabilized!") 
+            stabilization_time = 0;
+            for y = 1:size(Y, 2)
+                stabilization_time_t = find(abs(Y(:, y) - Y(end, y)) < tol, 1, 'first');
+                if isempty(stabilization_time_t)
+                   error("Object's track could not be stabilized!") 
+                end
+                if stabilization_time_t > stabilization_time
+                   stabilization_time = stabilization_time_t; 
+                end
             end
-            Ypp = Y(stabilization_time);
+            Ypp = Y(stabilization_time, :);
 
             % Measure step response
             U(stabilization_time:end) = step_response_struct.init_point + step_response_struct.step_size;
             Y = step_response_struct.object(U);
 
             % Scale step response
-            Y = (Y - Ypp) / step_response_struct.step_size;
+            for y = 1:size(Y, 2)
+                Y(:, y) = (Y(:, y) - Ypp(y)) / step_response_struct.step_size;
+            end
             
             % Trim step response from left and right
-            if stabilization_time ~= size(Y, 2)
-                Y = Y(stabilization_time+1 : end);
+            if stabilization_time ~= size(Y, 1)
+                Y = Y(stabilization_time+1 : end, :);
             else
                 error('Object could not be stabilized!')
             end
-            Y = Y(1 : find(abs(Y - Y(end)) < tol, 1, 'first'));
+            
+            stabilization_time = 0;
+            for y = 1:size(Y, 2)
+                stabilization_time_t = find(abs(Y(:, y) - Y(end, y)) < tol, 1, 'first');
+                if isempty(stabilization_time_t)
+                   error("Object's track could not be stabilized!") 
+                end
+                if stabilization_time_t > stabilization_time
+                   stabilization_time = stabilization_time_t; 
+                end
+            end
+            
+            % Return trimmed output
+            Y = Y(1:stabilization_time, :);
             
         end
 
         %================================================================
-        % Binds MIMO object function to a single SISO track with given
+        % Binds MIMO object function to a single SIMO track with given
         % parameters.
         %
         % @param bind_struct : structure that describes way bind should
@@ -824,8 +1003,6 @@ classdef DMC < handle
         %
         %        .input_num - number of the free input
         %
-        %        .output_num - number of the required PV
-        %
         %        .input_type - type of the free input ('CV' or 'DV') 
         %
         % @param input : free input course
@@ -833,22 +1010,22 @@ classdef DMC < handle
         function output = bind(bind_struct, input)
             
             % Initialize input
-            U = zeros(bind_struct.shape(1), size(input, 2));
-            Z = zeros(bind_struct.shape(2), size(input, 2));
+            U = zeros(size(input, 1), bind_struct.shape(1));
+            Z = zeros(size(input, 1), bind_struct.shape(2));
             
             % Fill input matrices
-            for u = 1:size(U, 1)
-                U(u, :) = bind_struct.U(u);
+            for u = 1:size(U, 2)
+                U(:, u) = bind_struct.U(u);
             end
-            for z = 1:size(Z, 1)
-                Z(z, :) = bind_struct.Z(z);
+            for z = 1:size(Z, 2)
+                Z(:, z) = bind_struct.Z(z);
             end
             
             % Set free CV
-            if bind_struct.input_type == 'CV'
-                U(bind_struct.input_num, :) = input;
-            elseif bind_struct.input_type == 'DV'
-                Z(bind_struct.input_num, :) = input;
+            if strcmp(bind_struct.input_type,'CV')
+                U(:, bind_struct.input_num) = input;
+            elseif strcmp(bind_struct.input_type, 'DV')
+                Z(:, bind_struct.input_num) = input;
             else
                 error('Wrong input type!')
             end
@@ -859,7 +1036,6 @@ classdef DMC < handle
             else
                 output = bind_struct.object(U);
             end
-            output = output(bind_struct.output_num, :);
             
         end
         
@@ -881,6 +1057,7 @@ classdef DMC < handle
             val = obj.N_shadow;
         end
         function set.N(obj, N)
+            warning('N changed! Psi matrix can of be the wrong size')
             obj.N_shadow = N;
             obj.verify_params()
             obj.solve();
@@ -891,6 +1068,7 @@ classdef DMC < handle
             val = obj.Nu_shadow;
         end
         function set.Nu(obj, Nu)
+            warning('Nu changed! Lambda matrix can of be the wrong size')
             obj.Nu_shadow = Nu;
             obj.verify_params()
             obj.solve();
@@ -921,8 +1099,41 @@ classdef DMC < handle
             val = obj.lambda_shadow;
         end
         function set.lambda(obj, lambda)
+            
+            % Check if lambda is of the right size
+            if any(size(lambda) ~= [obj.Nu * obj.nu, obj.Nu * obj.nu]) && ...
+               any(size(lambda) ~= [1 1])
+               error('Lambda matrix should be either of (Nu * nu) x (Nu * nu) size or a scalar!') 
+            end
+            % If lambda is given with a matrix check if it is diagonal
+            if any(size(lambda) == [obj.Nu * obj.nu, obj.Nu * obj.nu])
+                if ~isdiag(lambda)
+                   error('Lambda is not diagonal!') 
+                end
+            end
             obj.lambda_shadow = lambda;
-            obj.verify_params()
+            obj.verify_params();
+            obj.solve();
+            obj.reset();
+        end
+
+        function val = get.psi(obj)
+            val = obj.psi_shadow;
+        end
+        function set.psi(obj, psi)
+            % Check if psi is of the right size
+            if any(size(psi) ~= [obj.N * obj.ny, obj.N * obj.ny]) && ...
+               any(size(psi) ~= [1 1])
+               error('Psi matrix should be either of (N * ny) x (N * ny) size or a scalar!') 
+            end
+            % If lambda is given with a matrix check if it is diagonal
+            if any(size(psi) == [obj.N * obj.ny, obj.N * obj.ny])
+                if ~isdiag(psi)
+                   error('Psi is not diagonal!') 
+                end
+            end
+            obj.psi_shadow = psi;
+            obj.verify_params();
             obj.solve();
             obj.reset();
         end
@@ -933,6 +1144,13 @@ classdef DMC < handle
         function set.K(obj, K)
             obj.K_shadow = K;
         end        
+        
+        function step_responses = get.step_responses(obj)
+            step_responses = obj.step_responses_shadow;
+        end
+        function z_step_responses = get.z_step_responses (obj)
+            z_step_responses  = obj.z_step_responses_shadow ;
+        end
         
         function Mp = get.Mp(obj)
             Mp = obj.Mp_shadow;
